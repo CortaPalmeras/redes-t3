@@ -1,23 +1,36 @@
 import struct
 import time
 
-MSG_TIMEOUT = 1
 
 class Header:
-    def __init__(self, header: bytes) -> None:
-        self.dst_ip: int
-        self.dst_port: int
-        self.len: int
-        self.id: int
-        self.offset: int
-        self.ttl: int
+    def __init__(self, \
+                 dst_ip: int, \
+                 dst_port: int, \
+                 size: int, \
+                 id: int, \
+                 offset: int, \
+                 ttl: int) -> None:
 
-        self.dst_ip, self.dst_port, self.len, self.id,\
-        self.offset, self.ttl = struct.unpack("6I", header)
+        self.dst_ip = dst_ip
+        self.dst_port = dst_port
+        self.size = size
+        self.id = id
+        self.offset = offset
+        self.ttl = ttl
 
-    def pack(self) -> bytes:
-        return struct.pack(f"6I", (self.dst_ip, self.dst_port, 
-                                   self.len, self.id, self.ttl))
+HEADER_FIELDS = 6
+HEADER_LEN = 4 * HEADER_FIELDS
+
+def pack_header(header: Header) -> bytes:
+    return struct.pack(f"{HEADER_FIELDS}I", header.dst_ip, header.dst_port, 
+                                            header.size, header.id, 
+                                            header.offset, header.ttl)
+
+def unpack_header(header: bytes) -> Header:
+    return Header(*struct.unpack(f"{HEADER_FIELDS}I", header))
+
+
+MSG_TIMEOUT = 1
 
 class FragmentedMessage:
     def __init__(self, len: int) -> None:
@@ -31,8 +44,9 @@ class FragmentedMessage:
 
     def add(self, msg: bytes, offset: int) -> None:
         if offset < self.next \
+            or offset + len(msg) > self.len \
             or len(msg) <= 0 \
-            or offset + len(msg) > self.len:
+            or offset in self.offsets:
             return
 
         self.msg[offset] = msg
@@ -55,16 +69,18 @@ class Defragmenter:
 
     def check_timeouts(self) -> None:
         current_time = time.time()
-        for key, timeout in self.timeouts.items():
-            if current_time - timeout > MSG_TIMEOUT:
-                del self.timeouts[key]
-                del self.messages[key]
+        timedout_keys = [key for key, timeout in self.timeouts.items() \
+                            if current_time - timeout > MSG_TIMEOUT]
 
-    def add_segment(self, header: Header, data: bytes) -> None:
+        for key in timedout_keys:
+            del self.timeouts[key]
+            del self.messages[key]
+
+    def add_segment(self, header: Header, data: bytes) -> bytes | None:
         self.check_timeouts()
 
         if header.id not in self.messages.keys():
-            self.messages[header.id] = FragmentedMessage(header.len)
+            self.messages[header.id] = FragmentedMessage(header.size)
             self.timeouts[header.id] = time.time()
         
         msg = self.messages[header.id]
@@ -72,7 +88,9 @@ class Defragmenter:
         self.timeouts[header.id] = time.time()
 
         if msg.is_complete():
-            print(msg.reconstruct().decode())
+            ret = msg.reconstruct()
             del self.messages[header.id]
             del self.timeouts[header.id]
+            return ret
+
 
