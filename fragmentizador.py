@@ -2,11 +2,110 @@ import os
 import random
 import socket
 import threading
+import struct
+import time
 import queue
 import sys
 import io
 
-from ip import *
+class Header:
+    def __init__(self, \
+                 dst_ip: int, \
+                 dst_port: int, \
+                 size: int, \
+                 id: int, \
+                 offset: int, \
+                 ttl: int) -> None:
+
+        self.dst_ip = dst_ip
+        self.dst_port = dst_port
+        self.size = size
+        self.id = id
+        self.offset = offset
+        self.ttl = ttl
+
+HEADER_FIELDS = 6
+HEADER_LEN = 4 * HEADER_FIELDS
+
+def pack_header(header: Header) -> bytes:
+    return struct.pack(f"{HEADER_FIELDS}I", header.dst_ip, header.dst_port, 
+                                            header.size, header.id, 
+                                            header.offset, header.ttl)
+
+def unpack_header(header: bytes) -> Header:
+    dst_ip: int
+    dst_port: int
+    size: int
+    id: int
+    offset: int
+    ttl: int
+    dst_ip, dst_port, size, id, offset, ttl = struct.unpack(f"{HEADER_FIELDS}I", header)
+    return Header(dst_ip, dst_port, size, id, offset, ttl)
+
+
+MSG_TIMEOUT = 1
+
+class FragmentedMessage:
+    def __init__(self, len: int) -> None:
+        self.len: int = len
+        self.next: int = 0
+        self.msg: dict[int, bytes] = dict()
+        self.offsets: set[int] = set()
+
+    def is_complete(self) -> bool:
+        return self.len == self.next
+
+    def add(self, msg: bytes, offset: int) -> None:
+        if offset < self.next \
+            or offset + len(msg) > self.len \
+            or len(msg) <= 0 \
+            or offset in self.offsets:
+            return
+
+        self.msg[offset] = msg
+        self.offsets.add(offset)
+
+        while self.next in self.offsets:
+            self.next += len(self.msg[self.next])
+
+    def reconstruct(self) -> bytes:
+        ret = b''
+        while len(ret) < self.next:
+            ret += self.msg[len(ret)]
+        return ret
+        
+
+class Defragmenter:
+    def __init__(self) -> None:
+        self.messages: dict[int, FragmentedMessage] = dict()
+        self.timeouts: dict[int, float] = dict()
+
+    def check_timeouts(self) -> None:
+        current_time = time.time()
+        timedout_keys = [key for key, timeout in self.timeouts.items() \
+                            if current_time - timeout > MSG_TIMEOUT]
+
+        for key in timedout_keys:
+            del self.timeouts[key]
+            del self.messages[key]
+
+    def add_segment(self, header: Header, data: bytes) -> bytes | None:
+        self.check_timeouts()
+
+        if header.id not in self.messages.keys():
+            self.messages[header.id] = FragmentedMessage(header.size)
+            self.timeouts[header.id] = time.time()
+        
+        msg = self.messages[header.id]
+        msg.add(data, header.offset)
+        self.timeouts[header.id] = time.time()
+
+        if msg.is_complete():
+            ret = msg.reconstruct()
+            del self.messages[header.id]
+            del self.timeouts[header.id]
+            return ret
+
 
 BUFFSIZE = 2 ** 15
 
@@ -19,7 +118,7 @@ def int_to_ip(ip: int) -> str:
 flag = "--enviar"
 help_string = f"""\
 USOS: {sys.orig_argv[0]} {sys.argv[0]} mi_ip:mi_puerto ip:puerto:mtu ...
-      {sys.orig_argv[0]} {sys.argv[0]} {flag} <archivo> ip_partida:puerto_partida ip_destino:puerto_destino ttl"""
+      {sys.orig_argv[0]} {sys.argv[0]} {flag} archivo ip_partida:puerto_partida ip_destino:puerto_destino ttl"""
 
 if len(sys.argv) < 2:
     print(help_string, file=sys.stderr)
@@ -111,9 +210,9 @@ def sendto(soc: socket.socket, msg: bytes, addr: tuple[str, int]) -> None:
 
 
 
-soc = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-soc.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-soc.bind(my_addr)
+reciever_soc = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+reciever_soc.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+reciever_soc.bind(my_addr)
 
 msg_queue: queue.Queue[bytes] = queue.Queue()
 
@@ -121,10 +220,12 @@ msg_queue: queue.Queue[bytes] = queue.Queue()
 # la cola del kernel y que este empiece a botarlos
 def get_messages() -> None:
     while True:
-        msg_queue.put(soc.recv(BUFFSIZE))
+        msg_queue.put(reciever_soc.recv(BUFFSIZE))
 
 reciever_thread = threading.Thread(target=get_messages, daemon=True)
 reciever_thread.start()
+
+sender_soc = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 try:
     segments = Defragmenter()
@@ -154,7 +255,7 @@ try:
         # el mensaje es enviado directamente a su destino si es que este se
         # encuentra en la lista de enlaces y el mensaje cabe completo
         elif dst_addr in links and len(msg) <= mtus[dst_addr]:
-            _ = sendto(soc, pack_header(header) + data, dst_addr)
+            _ = sendto(sender_soc, pack_header(header) + data, dst_addr)
             links.remove(dst_addr)
             links.append(dst_addr)
 
@@ -166,7 +267,7 @@ try:
             while mtus[links[i]] < len(msg):
                 i += 1
 
-            _ = sendto(soc, pack_header(header) + data, links[i])
+            _ = sendto(sender_soc, pack_header(header) + data, links[i])
             links.append(links.pop(i))
 
         # si el mensaje no cabe en ningún enlace entonces se fragmenta y 
@@ -180,7 +281,7 @@ try:
                 fragment_size = mtus[next_addr] - HEADER_LEN
                 fragment_data = data[sent_data : sent_data + fragment_size]
 
-                _ = sendto(soc, pack_header(header) + fragment_data, next_addr)
+                _ = sendto(sender_soc, pack_header(header) + fragment_data, next_addr)
                 links.append(next_addr)
 
                 sent_data += fragment_size
@@ -188,7 +289,9 @@ try:
 
 
 except KeyboardInterrupt:
-    soc.close()
+    sender_soc.close()
+    reciever_soc.close()
+    print("conección cerrada", file=sys.stderr)
     exit()
 
 
