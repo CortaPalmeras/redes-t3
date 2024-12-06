@@ -17,12 +17,12 @@ class Header:
                  offset: int, \
                  ttl: int) -> None:
 
-        self.dst_ip = dst_ip
-        self.dst_port = dst_port
-        self.size = size
-        self.id = id
-        self.offset = offset
-        self.ttl = ttl
+        self.dst_ip: int = dst_ip
+        self.dst_port: int = dst_port
+        self.size: int = size
+        self.id: int = id
+        self.offset: int = offset
+        self.ttl: int = ttl
 
 HEADER_FIELDS = 6
 HEADER_LEN = 4 * HEADER_FIELDS
